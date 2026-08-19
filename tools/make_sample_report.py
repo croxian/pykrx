@@ -77,13 +77,14 @@ def main(out: str = "sample_신규상장_등락률.xlsx") -> None:
 
     index_pct = {k: pct_change_from_prev_close(v) for k, v in index_frames.items()}
 
-    main_df, bearish_df, skipped = collect(
+    result = collect(
         IPOS,
         resolve_ticker=lambda name, date: TICKERS.get(name),
         fetch_ohlcv=lambda t, s, e: FRAMES[t],
         index_pct=index_pct,
         verbose=False,
     )
+    main_df, bearish_df, skipped = result.main, result.bearish, result.skipped
     failed_df = pd.DataFrame([{"종목명": s.name, "상장일": s.listing_date,
                                "사유": s.reason} for s in skipped])
     write_report(out, main_df, bearish_df, failed_df, {

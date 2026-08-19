@@ -57,6 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="티커 매칭 시 KRX 전종목시세 조회를 쓰지 않음 (KIND 만 사용)")
     p.add_argument("--no-verify-listing", action="store_true",
                    help="상장일 이전 시세 검증을 건너뜀")
+    p.add_argument("--no-transfer-listing", action="store_true",
+                   help="이전상장/재상장 종목을 결과에서 제외")
+    p.add_argument("--no-adjust-prices", action="store_true",
+                   help="38 시초가 기준 수정주가 보정을 끔")
+    p.add_argument("--no-naver-search", action="store_true",
+                   help="티커 매칭 시 네이버 종목 검색을 쓰지 않음")
     p.add_argument("--listings-file", action="append", default=[],
                    metavar="시장=경로",
                    help="KIND 에서 직접 받은 상장법인목록 파일 "
@@ -95,7 +101,11 @@ def main(argv: list[str] | None = None) -> int:
         ipos = [r for r in ipos if not any(p in r.name for p in SPAC_PATTERNS)]
     if args.limit:
         ipos = ipos[: args.limit]
-    print(f"      신규상장 {len(ipos)} 건")
+    with_first = sum(1 for r in ipos if r.first_price)
+    print(f"      신규상장 {len(ipos)} 건 (시초가 확보 {with_first} 건)")
+    if with_first < len(ipos) * 0.5:
+        print("      [경고] 38 목록에서 시초가를 거의 못 읽었습니다. "
+              "수정주가 보정과 이전상장 확인이 제한됩니다.", file=sys.stderr)
     if not ipos:
         print("수집된 신규상장 종목이 없습니다.", file=sys.stderr)
         return 1
@@ -105,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         ticker_map_csv=args.ticker_map,
         listings_files=args.listings_file,
         use_krx_by_date=not (args.no_krx_fallback or args.no_krx),
+        use_naver_search=not args.no_naver_search,
     )
     resolver.assign(ipos)
     matched = sum(1 for r in ipos if (r.name, r.listing_date) in resolver.resolutions)
@@ -126,7 +137,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"      {name}: {len(frame)} 거래일")
 
     print("[4/5] 종목별 시세 수집 및 등락률 계산")
-    main_df, bearish_df, skipped = collect(
+    result = collect(
         ipos,
         resolve_ticker=resolver.resolve,
         fetch_ohlcv=lambda t, s, e: _sleep_then(
@@ -135,13 +146,23 @@ def main(argv: list[str] | None = None) -> int:
         index_pct=index_pct,
         days=args.days,
         verify_listing=not args.no_verify_listing,
+        include_transfer_listing=not args.no_transfer_listing,
+        adjust_prices=not args.no_adjust_prices,
+        candidates_hint=resolver.same_day_candidates,
     )
+    main_df, bearish_df, skipped = result.main, result.bearish, result.skipped
     failed_df = pd.DataFrame(
         [{"종목명": s.name, "상장일": s.listing_date, "사유": s.reason} for s in skipped]
     )
     stocks = main_df["종목코드"].nunique() if not main_df.empty else 0
     print(f"      양봉 종목 {stocks} 개 / {len(main_df)} 행, "
           f"음봉 제외 {len(bearish_df)} 개, 실패 {len(failed_df)} 개")
+    if not result.adjustments.empty:
+        print(f"      수정주가 보정 {len(result.adjustments)} 종목 "
+              "(무상증자·액면분할 등, '수정주가보정' 시트 참고)")
+    if not result.transfers.empty:
+        print(f"      이전상장/재상장 {len(result.transfers)} 종목 포함 "
+              "('이전상장' 시트 참고)")
 
     match_df = pd.DataFrame(
         [{"38 종목명": name, "상장일": date, "종목코드": res.ticker,
@@ -158,12 +179,15 @@ def main(argv: list[str] | None = None) -> int:
         "양봉 종목 수": stocks,
         "음봉 제외 종목 수": len(bearish_df),
         "수집 실패 종목 수": len(failed_df),
+        "수정주가 보정 종목 수": len(result.adjustments),
+        "이전상장 포함 종목 수": len(result.transfers),
         "수집 일수": f"D+0 ~ D+{args.days - 1}",
         "시세 소스": args.price_source if krxdata.krx_login_ok() else "naver",
         "지수 소스": args.index_source,
         "생성 시각": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    write_report(out_path, main_df, bearish_df, failed_df, meta, match_df)
+    write_report(out_path, main_df, bearish_df, failed_df, meta, match_df,
+                 result.adjustments, result.transfers)
     if args.csv:
         main_df.to_csv(args.csv, index=False, encoding="utf-8-sig")
         print(f"      CSV 저장 -> {args.csv}")

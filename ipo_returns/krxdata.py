@@ -32,6 +32,7 @@ import re
 import time
 
 import ast
+import json
 
 import pandas as pd
 import requests
@@ -189,6 +190,62 @@ def fetch_kind_listings(market: str, timeout: int = 30,
     raise RuntimeError(f"KIND {market} 상장법인목록 조회 실패: {last_err}")
 
 
+NAVER_SEARCH_URLS = (
+    "https://m.stock.naver.com/api/search/stock",       # {"stocks":[{itemCode, stockName}]}
+    "https://ac.finance.naver.com/ac",                  # 자동완성(구형)
+)
+
+
+def _extract_code_name_pairs(payload: str) -> list[tuple[str, str]]:
+    """네이버 검색 응답에서 (6자리 코드, 종목명) 쌍을 최대한 건져낸다."""
+    pairs: list[tuple[str, str]] = []
+    try:
+        data = json.loads(payload)
+    except Exception:
+        data = None
+
+    def walk(node, parent_code=None):
+        if isinstance(node, dict):
+            code = node.get("itemCode") or node.get("code") or node.get("cd")
+            name = (node.get("stockName") or node.get("name") or node.get("nm")
+                    or node.get("korName"))
+            if code and name and re.fullmatch(r"[A-Z]?\d{6}", str(code)):
+                pairs.append((str(code)[-6:], str(name)))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            flat = [x for x in node if isinstance(x, (str, int))]
+            code = next((str(x) for x in flat if re.fullmatch(r"\d{6}", str(x))), None)
+            name = next((str(x) for x in flat
+                         if isinstance(x, str) and not re.fullmatch(r"\d+", x)), None)
+            if code and name:
+                pairs.append((code, name))
+            for value in node:
+                walk(value)
+
+    if data is not None:
+        walk(data)
+    return pairs
+
+
+def naver_search_ticker(name: str, timeout: int = 15) -> list[tuple[str, str]]:
+    """네이버 금융 검색으로 (티커, 종목명) 후보를 얻는다. 실패하면 빈 목록."""
+    for url in NAVER_SEARCH_URLS:
+        params = ({"query": name, "pageSize": 10} if "m.stock" in url else
+                  {"q": name, "q_enc": "utf-8", "st": 111, "r_format": "json",
+                   "r_enc": "utf-8", "r_unicode": 0, "t_koreng": 1, "r_lt": 111})
+        try:
+            resp = requests.get(url, params=params, headers=NAVER_HEADERS,
+                                timeout=timeout)
+            resp.raise_for_status()
+            pairs = _extract_code_name_pairs(resp.text)
+            if pairs:
+                return pairs
+        except Exception:
+            continue
+    return []
+
+
 def load_listings_file(path: str, market: str = "미상") -> list[Listing]:
     """KIND 에서 직접 내려받은 상장법인목록 파일을 읽는다.
 
@@ -277,10 +334,12 @@ class TickerResolver:
     def __init__(self, markets: tuple[str, ...] = MARKETS, use_kind: bool = True,
                  use_krx_by_date: bool = True, ticker_map_csv: str | None = None,
                  listings_files: "list[str] | None" = None,
+                 use_naver_search: bool = True,
                  fuzzy_cutoff: float = 0.86, verbose: bool = True):
         self.markets = markets
         self.use_kind = use_kind
         self.listings_files = listings_files or []
+        self.use_naver_search = use_naver_search
         self.use_krx_by_date = use_krx_by_date
         self.fuzzy_cutoff = fuzzy_cutoff
         self.verbose = verbose
@@ -447,6 +506,17 @@ class TickerResolver:
                         self.resolutions[(name, on_date)] = found
                         return found
 
+        # 네이버 금융 검색 (KIND 목록에 없는 스팩·리츠 등 대응)
+        if self.use_naver_search:
+            for ticker, naver_name in naver_search_ticker(name):
+                score = self.name_score(name, naver_name)
+                if score >= 0.9:
+                    listing = Listing(ticker, naver_name, "미상", None, "naver")
+                    self.add(listing)
+                    found = Resolution(ticker, "미상", "naver", naver_name, score)
+                    self.resolutions[(name, on_date)] = found
+                    return found
+
         # 전체 이름 대상 유사도 매칭 (보수적 기준)
         close = [key for key in difflib.get_close_matches(
             norm, list(self.by_norm), n=3, cutoff=self.fuzzy_cutoff)
@@ -458,6 +528,10 @@ class TickerResolver:
             self.resolutions[(name, on_date)] = found
             return found
         return None
+
+    def same_day_candidates(self, on_date: dt.date) -> str:
+        """진단용: 그 날 상장한 것으로 알려진 종목들."""
+        return ", ".join(f"{c.name}({c.ticker})" for c in self.by_date.get(on_date, []))
 
     @staticmethod
     def _pick(candidates: list[Listing], on_date: dt.date) -> Listing:

@@ -104,13 +104,14 @@ class CollectTest(unittest.TestCase):
         index_pct = {"KOSPI": pct_change_from_prev_close(INDEX),
                      "KOSDAQ": pct_change_from_prev_close(INDEX)}
 
-        main_df, bearish_df, skipped = collect(
+        result = collect(
             ipos,
             resolve_ticker=lambda name, date: tickers.get(name),
             fetch_ohlcv=lambda t, s, e: frames[t],
             index_pct=index_pct,
             verbose=False,
         )
+        main_df, bearish_df, skipped = result.main, result.bearish, result.skipped
         self.assertEqual(sorted(main_df["종목명"].unique()), ["가나테크"])
         self.assertEqual(len(main_df), 5)
         self.assertEqual(list(bearish_df["종목명"]), ["다라바이오"])
@@ -121,3 +122,85 @@ class CollectTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# 인스웨이브시스템즈 형태: 상장 후 무상증자로 네이버 수정주가가 1/4 로 축소된 경우
+ADJUSTED = make_ohlcv(
+    ["20230925", "20230926", "20230927"],
+    [[12_050, 13_000, 11_000, 12_500, 100],
+     [12_500, 12_800, 12_000, 12_750, 90],
+     [12_750, 13_500, 12_600, 13_000, 80]],
+)
+
+
+class AdjustedPriceTest(unittest.TestCase):
+    def setUp(self):
+        from ipo_returns.pipeline import price_adjustment_factor
+
+        self.factor_fn = price_adjustment_factor
+        self.ipo = IpoRow("인스웨이브시스템즈", 24_000, dt.date(2023, 9, 25),
+                          first_price=48_200)
+        self.index_pct = {"KOSPI": pd.DataFrame(), "KOSDAQ": pd.DataFrame()}
+
+    def test_factor_from_38_first_price(self):
+        self.assertAlmostEqual(self.factor_fn(self.ipo, ADJUSTED), 4.0, places=2)
+
+    def test_no_factor_when_prices_already_match(self):
+        ipo = IpoRow("보통회사", 10_000, dt.date(2023, 9, 25), first_price=12_050)
+        self.assertEqual(self.factor_fn(ipo, ADJUSTED), 1.0)
+
+    def test_listing_day_return_uses_real_price(self):
+        factor = self.factor_fn(self.ipo, ADJUSTED)
+        rows = build_stock_rows(self.ipo, "450520", "KOSDAQ", ADJUSTED,
+                                self.index_pct, days=3, factor=factor)
+        # 보정 전이면 (12050/24000-1)= -49.8%, 보정 후에는 공모가의 약 2 배
+        self.assertAlmostEqual(rows[0]["시가등락률"], 100.83, places=1)
+        self.assertAlmostEqual(rows[0]["종가등락률"],
+                               (12_500 * factor / 24_000 - 1) * 100, places=6)
+
+    def test_next_day_returns_are_unaffected_by_factor(self):
+        plain = build_stock_rows(self.ipo, "450520", "KOSDAQ", ADJUSTED,
+                                 self.index_pct, days=3)
+        fixed = build_stock_rows(self.ipo, "450520", "KOSDAQ", ADJUSTED,
+                                 self.index_pct, days=3, factor=4.0)
+        self.assertAlmostEqual(plain[1]["종가등락률"], fixed[1]["종가등락률"])
+
+
+class TransferListingTest(unittest.TestCase):
+    """코넥스 -> 코스닥 이전상장처럼 상장일 이전 시세가 있는 종목."""
+
+    FRAME = make_ohlcv(
+        ["20230620", "20230621", "20230629", "20230630", "20230703"],
+        [[5_000, 5_100, 4_900, 5_000, 10],      # 이전 시장에서의 거래
+         [5_000, 5_050, 4_950, 5_000, 10],
+         [5_800, 7_000, 5_700, 6_500, 100],     # 상장일
+         [6_500, 6_800, 6_200, 6_300, 90],
+         [6_300, 6_400, 6_000, 6_100, 80]],
+    )
+
+    def _collect(self, ipo, **kwargs):
+        return collect([ipo],
+                       resolve_ticker=lambda n, d: ("232830", "KOSDAQ"),
+                       fetch_ohlcv=lambda t, s, e: self.FRAME,
+                       index_pct={"KOSPI": pd.DataFrame(), "KOSDAQ": pd.DataFrame()},
+                       verbose=False, **kwargs)
+
+    def test_included_when_first_price_confirms_ticker(self):
+        ipo = IpoRow("시큐센", 3_000, dt.date(2023, 6, 29), first_price=5_800)
+        result = self._collect(ipo)
+        self.assertEqual(len(result.main), 3)
+        self.assertEqual(list(result.transfers["종목명"]), ["시큐센"])
+        self.assertEqual(result.skipped, [])
+
+    def test_excluded_when_first_price_disagrees(self):
+        # 38 시초가와 조회된 시가가 전혀 다르면 티커 오매칭으로 본다
+        ipo = IpoRow("엉뚱한종목", 3_000, dt.date(2023, 6, 29), first_price=30_000)
+        result = self._collect(ipo)
+        self.assertTrue(result.main.empty)
+        self.assertIn("오매칭", result.skipped[0].reason)
+
+    def test_opt_out(self):
+        ipo = IpoRow("시큐센", 3_000, dt.date(2023, 6, 29), first_price=5_800)
+        result = self._collect(ipo, include_transfer_listing=False)
+        self.assertTrue(result.main.empty)
+        self.assertIn("이전상장", result.skipped[0].reason)

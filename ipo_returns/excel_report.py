@@ -161,7 +161,9 @@ def _write_info_sheet(ws, meta: dict) -> None:
 
 def write_report(path: str, main_df: pd.DataFrame, bearish_df: pd.DataFrame,
                  failed_df: pd.DataFrame, meta: dict | None = None,
-                 match_df: pd.DataFrame | None = None) -> str:
+                 match_df: pd.DataFrame | None = None,
+                 adjust_df: pd.DataFrame | None = None,
+                 transfer_df: pd.DataFrame | None = None) -> str:
     wb = Workbook()
     ws = wb.active
     ws.title = "신규상장_등락률"
@@ -170,6 +172,10 @@ def write_report(path: str, main_df: pd.DataFrame, bearish_df: pd.DataFrame,
     _write_table(wb.create_sheet("제외_음봉"), bearish_df,
                  rate_cols=("시가등락률", "종가등락률"))
     _write_table(wb.create_sheet("수집실패"), failed_df)
+    if adjust_df is not None and not adjust_df.empty:
+        _write_table(wb.create_sheet("수정주가보정"), adjust_df)
+    if transfer_df is not None and not transfer_df.empty:
+        _write_table(wb.create_sheet("이전상장"), transfer_df)
     if match_df is not None:
         _write_table(wb.create_sheet("티커매칭"), match_df)
     _write_info_sheet(wb.create_sheet("설명"), meta or {})
