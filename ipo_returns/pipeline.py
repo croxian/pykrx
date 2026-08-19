@@ -102,9 +102,15 @@ def collect(
     index_pct: dict[str, pd.DataFrame],
     days: int = 5,
     lookahead_days: int = 21,
+    prior_days: int = 40,
+    verify_listing: bool = True,
     verbose: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[Skipped]]:
-    """신규상장 목록 -> (양봉 종목 등락률, 음봉 제외 목록, 수집 실패 목록)."""
+    """신규상장 목록 -> (양봉 종목 등락률, 음봉 제외 목록, 수집 실패 목록).
+
+    verify_listing=True 면 상장일 이전에 시세가 있는 종목(티커 오매칭 또는
+    이전상장·재상장)을 데이터에서 제외하고 실패 목록에 남긴다.
+    """
     kept: list[dict] = []
     bearish: list[dict] = []
     skipped: list[Skipped] = []
@@ -119,7 +125,7 @@ def collect(
         ticker, market = resolved
         try:
             ohlcv = fetch_ohlcv(
-                ticker, ipo.listing_date,
+                ticker, ipo.listing_date - dt.timedelta(days=prior_days),
                 ipo.listing_date + dt.timedelta(days=lookahead_days),
             )
         except Exception as exc:
@@ -128,6 +134,15 @@ def collect(
         if ohlcv is None or ohlcv.empty:
             skipped.append(Skipped(ipo.name, ipo.listing_date, "시세 데이터 없음"))
             continue
+
+        if verify_listing:
+            prior = ohlcv[ohlcv.index < pd.Timestamp(ipo.listing_date)]
+            if not prior.empty:
+                skipped.append(Skipped(
+                    ipo.name, ipo.listing_date,
+                    f"상장일 이전 시세 존재({ticker}, {len(prior)}일) "
+                    "- 티커 오매칭 또는 이전상장/재상장 의심"))
+                continue
 
         bullish = is_bullish_listing_day(ohlcv, ipo.listing_date)
         if bullish is None:

@@ -41,6 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="종목 시세 소스 (krx=무수정주가, naver=수정주가)")
     p.add_argument("--exclude-spac", action="store_true", help="스팩 종목 제외")
     p.add_argument("--limit", type=int, default=0, help="처리 종목 수 제한 (테스트용)")
+    p.add_argument("--ticker-map", default=None,
+                   help="수동 매핑 CSV (종목명,종목코드[,시장])")
+    p.add_argument("--no-krx-fallback", action="store_true",
+                   help="티커 매칭 시 KRX 전종목시세 조회를 쓰지 않음 (KIND 만 사용)")
+    p.add_argument("--no-verify-listing", action="store_true",
+                   help="상장일 이전 시세 검증을 건너뜀")
     return p
 
 
@@ -66,7 +72,17 @@ def main(argv: list[str] | None = None) -> int:
         print("수집된 신규상장 종목이 없습니다.", file=sys.stderr)
         return 1
 
-    print("[2/4] KOSPI / KOSDAQ 지수 일봉 수집")
+    print("[2/5] 티커 매칭 (KIND 상장법인목록 기준)")
+    resolver = krxdata.TickerResolver(
+        ticker_map_csv=args.ticker_map,
+        use_krx_by_date=not args.no_krx_fallback,
+    )
+    resolver.assign(ipos)
+    matched = sum(1 for r in ipos if (r.name, r.listing_date) in resolver.resolutions)
+    print(f"      상장일 기준 매칭 {matched}/{len(ipos)} 건 "
+          "(나머지는 이름·스팩표기·KRX 조회로 재시도)")
+
+    print("[3/5] KOSPI / KOSDAQ 지수 일봉 수집")
     idx_start = min(r.listing_date for r in ipos) - dt.timedelta(days=15)
     idx_end = max(r.listing_date for r in ipos) + dt.timedelta(days=30)
     index_pct: dict[str, pd.DataFrame] = {}
@@ -79,8 +95,7 @@ def main(argv: list[str] | None = None) -> int:
         index_pct[name] = pct_change_from_prev_close(frame)
         print(f"      {name}: {len(frame)} 거래일")
 
-    print("[3/4] 종목별 시세 수집 및 등락률 계산")
-    resolver = krxdata.TickerResolver()
+    print("[4/5] 종목별 시세 수집 및 등락률 계산")
     main_df, bearish_df, skipped = collect(
         ipos,
         resolve_ticker=resolver.resolve,
@@ -88,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
             t, s, e, prefer=args.price_source),
         index_pct=index_pct,
         days=args.days,
+        verify_listing=not args.no_verify_listing,
     )
     failed_df = pd.DataFrame(
         [{"종목명": s.name, "상장일": s.listing_date, "사유": s.reason} for s in skipped]
@@ -96,7 +112,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"      양봉 종목 {stocks} 개 / {len(main_df)} 행, "
           f"음봉 제외 {len(bearish_df)} 개, 실패 {len(failed_df)} 개")
 
-    print(f"[4/4] 엑셀 저장 -> {out_path}")
+    match_df = pd.DataFrame(
+        [{"38 종목명": name, "상장일": date, "종목코드": res.ticker,
+          "시장": res.market, "매칭 종목명": res.matched_name,
+          "매칭방식": res.method, "유사도": round(res.score, 3)}
+         for (name, date), res in sorted(resolver.resolutions.items(),
+                                         key=lambda kv: kv[0][1])]
+    )
+
+    print(f"[5/5] 엑셀 저장 -> {out_path}")
     meta = {
         "조회 구간": f"{args.start} ~ {args.end}",
         "신규상장 종목 수": len(ipos),
@@ -107,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
         "시세 소스": args.price_source,
         "생성 시각": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    write_report(out_path, main_df, bearish_df, failed_df, meta)
+    write_report(out_path, main_df, bearish_df, failed_df, meta, match_df)
     if args.csv:
         main_df.to_csv(args.csv, index=False, encoding="utf-8-sig")
         print(f"      CSV 저장 -> {args.csv}")
