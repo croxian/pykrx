@@ -121,3 +121,21 @@ class NaverIndexParseTest(unittest.TestCase):
 
         pct = pct_change_from_prev_close(parse_naver_index(self.SAMPLE))
         self.assertAlmostEqual(pct.iloc[1]["종가"], (2607.31 / 2669.81 - 1) * 100)
+
+
+class DigitGuardTest(unittest.TestCase):
+    def test_different_numbers_never_match(self):
+        self.assertEqual(
+            TickerResolver.name_score("디비금융스팩11호", "디비금융스팩12호"), 0.0)
+        self.assertEqual(TickerResolver.name_score("교보스팩14호", "교보스팩15호"), 0.0)
+
+    def test_same_number_different_notation_matches(self):
+        self.assertEqual(
+            TickerResolver.name_score("디비금융스팩11호", "디비금융제11호스팩"), 1.0)
+
+    def test_assign_rejects_wrong_number_on_same_day(self):
+        listings = [Listing("477760", "디비금융스팩12호", "KOSDAQ", dt.date(2023, 7, 12)),
+                    Listing("477770", "다른회사", "KOSDAQ", dt.date(2023, 7, 12))]
+        resolver = offline_resolver(listings)
+        resolver.assign([IpoRow("디비금융스팩11호", 2000, dt.date(2023, 7, 12))])
+        self.assertIsNone(resolver.resolve("디비금융스팩11호", dt.date(2023, 7, 12)))

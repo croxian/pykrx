@@ -87,6 +87,31 @@ def has_krx_credentials() -> bool:
     return bool(os.getenv("KRX_ID") and os.getenv("KRX_PW"))
 
 
+def _looks_like_login_failure(exc: Exception) -> bool:
+    """KRX 로그인 응답이 JSON 이 아닐 때 나는 예외인가."""
+    text = str(exc)
+    return "Expecting value" in text or "JSONDecode" in type(exc).__name__
+
+
+def _guard_krx_login(fn):
+    """호출 중 KRX 로그인이 죽으면 KRX 를 끄고 한 번 더 시도한다.
+
+    pykrx 는 네이버 요청 경로에서도 KRX 세션을 갱신하려 들기 때문에,
+    KRX 가 차단된 상태에서는 네이버 조회까지 같은 예외로 실패한다.
+    """
+    from . import pykrx_safe
+
+    try:
+        return fn()
+    except Exception as exc:
+        if not _looks_like_login_failure(exc):
+            raise
+        pykrx_safe.disable_krx()
+        print("      [안내] KRX 로그인이 실패해 KRX 사용을 끕니다 "
+              "(이후 네이버로만 조회).")
+        return fn()
+
+
 def krx_login_ok() -> bool:
     """pykrx 가 KRX 로그인 세션을 들고 있는지."""
     from . import pykrx_safe
@@ -329,6 +354,9 @@ class TickerResolver:
             return 0.0
         if norm_a == norm_b:
             return 1.0
+        # 숫자가 다르면 다른 회사다: '디비금융스팩11호' != '디비금융스팩12호'
+        if re.findall(r"\d+", norm_a) != re.findall(r"\d+", norm_b):
+            return 0.0
         key_a, key_b = spac_key(name_a), spac_key(name_b)
         if key_a and key_a == key_b:
             return 1.0
@@ -420,8 +448,9 @@ class TickerResolver:
                         return found
 
         # 전체 이름 대상 유사도 매칭 (보수적 기준)
-        close = difflib.get_close_matches(norm, list(self.by_norm), n=1,
-                                          cutoff=self.fuzzy_cutoff)
+        close = [key for key in difflib.get_close_matches(
+            norm, list(self.by_norm), n=3, cutoff=self.fuzzy_cutoff)
+            if re.findall(r"\d+", key) == re.findall(r"\d+", norm)]
         if close:
             pick = self._pick(self.by_norm[close[0]], on_date)
             found = Resolution(pick.ticker, pick.market, "fuzzy", pick.name,
@@ -456,9 +485,9 @@ def get_stock_ohlcv(ticker: str, start: dt.date, end: dt.date,
     problems: list[str] = []
     for source in order:
         try:
-            df = stock.get_market_ohlcv_by_date(
-                ymd(start), ymd(end), ticker, adjusted=(source == "naver")
-            )
+            df = _guard_krx_login(lambda src=source: stock.get_market_ohlcv_by_date(
+                ymd(start), ymd(end), ticker, adjusted=(src == "naver")
+            ))
             if df is not None and not df.empty:
                 return df
             problems.append(f"{source}: 데이터 없음")
@@ -520,8 +549,8 @@ def get_index_ohlcv(market: str, start: dt.date, end: dt.date,
 
     if source in ("auto", "krx") and (source == "krx" or krx_login_ok()):
         try:
-            df = stock.get_index_ohlcv_by_date(ymd(start), ymd(end),
-                                               INDEX_TICKERS[market])
+            df = _guard_krx_login(lambda: stock.get_index_ohlcv_by_date(
+                ymd(start), ymd(end), INDEX_TICKERS[market]))
             if df is not None and not df.empty:
                 return df
             problems.append("krx: 데이터 없음")

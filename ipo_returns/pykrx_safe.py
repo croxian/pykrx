@@ -21,6 +21,29 @@ KRX_LOGIN_OK = False
 KRX_LOGIN_ERROR: str | None = None
 
 
+def disable_krx() -> None:
+    """이 프로세스에서 KRX 로그인을 완전히 끈다.
+
+    pykrx 는 **네이버 요청을 보낼 때도** ``webio.Get.read`` -> ``get_session()``
+    -> ``get_auth_session()`` 을 거치고, 세션이 없는데 KRX_ID/KRX_PW 가 있으면
+    그 자리에서 로그인을 시도한다. KRX 가 IP 를 차단한 상태면 로그인 응답이
+    HTML 이라 ``JSONDecodeError`` 가 나고, **네이버 시세까지 전부 실패한다.**
+    자격증명을 프로세스 환경에서 지워 그 경로를 끊는다.
+    """
+    global KRX_LOGIN_OK
+
+    os.environ.pop("KRX_ID", None)
+    os.environ.pop("KRX_PW", None)
+    KRX_LOGIN_OK = False
+    try:
+        from pykrx.website.comm import auth, webio
+
+        auth.set_auth_session(None)
+        webio.set_session(None)
+    except Exception:
+        pass
+
+
 def _purge_pykrx_modules() -> None:
     for name in [m for m in sys.modules if m == "pykrx" or m.startswith("pykrx.")]:
         del sys.modules[name]
@@ -35,16 +58,12 @@ def import_stock():
     global KRX_LOGIN_OK, KRX_LOGIN_ERROR
 
     if os.getenv("IPO_NO_KRX") == "1":
-        saved = {key: os.environ.pop(key, None) for key in ("KRX_ID", "KRX_PW")}
-        try:
-            from pykrx import stock
+        os.environ.pop("KRX_ID", None)
+        os.environ.pop("KRX_PW", None)
+        from pykrx import stock
 
-            KRX_LOGIN_OK = False
-            return stock
-        finally:
-            for key, value in saved.items():
-                if value is not None:
-                    os.environ[key] = value
+        KRX_LOGIN_OK = False
+        return stock
 
     has_credentials = bool(os.getenv("KRX_ID") and os.getenv("KRX_PW"))
     try:
@@ -55,8 +74,11 @@ def import_stock():
     except Exception as exc:
         KRX_LOGIN_ERROR = f"{type(exc).__name__}: {exc}"
 
-    # 로그인 단계에서 죽은 것으로 보고, 자격증명 없이 다시 import
-    saved = {key: os.environ.pop(key, None) for key in ("KRX_ID", "KRX_PW")}
+    # 로그인 단계에서 죽은 것으로 보고, 자격증명 없이 다시 import.
+    # 자격증명은 복원하지 않는다 - 복원하면 요청마다 로그인을 재시도해
+    # 네이버 경로까지 같은 예외로 죽는다.
+    os.environ.pop("KRX_ID", None)
+    os.environ.pop("KRX_PW", None)
     try:
         _purge_pykrx_modules()
         from pykrx import stock
@@ -72,7 +94,3 @@ def import_stock():
         return stock
     except Exception as exc:  # pykrx 자체가 망가진 경우
         raise RuntimeError(f"pykrx import 실패: {exc}") from exc
-    finally:
-        for key, value in saved.items():
-            if value is not None:
-                os.environ[key] = value
