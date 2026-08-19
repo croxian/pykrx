@@ -10,9 +10,13 @@
 
 시세
 ----
-종목 일봉은 KRX(무수정주가) → 실패 시 네이버(수정주가) 순으로 시도하고,
-지수(KOSPI 1001 / KOSDAQ 2001) 일봉은 KRX 에서만 받는다. pykrx 1.2.8+ 는
-KRX 조회에 로그인(``KRX_ID`` / ``KRX_PW``)이 필요하다.
+pykrx 1.2.8+ 의 data.krx.co.kr 조회에는 KRX 로그인이 필요하지만, 이 모듈은
+로그인이 안 되는 상황에서도 동작한다.
+
+* 종목 일봉: KRX(무수정주가) → 네이버(수정주가)
+* 지수 일봉: KRX → 네이버(``api.finance.naver.com``)
+
+따라서 KRX 계정이 없거나 로그인이 막혀도 전체 수집이 가능하다.
 """
 
 from __future__ import annotations
@@ -27,14 +31,29 @@ import os
 import re
 import time
 
+import ast
+
 import pandas as pd
 import requests
-from pykrx import stock
+
+from .pykrx_safe import import_stock
+
+stock = import_stock()
 
 KOSPI_INDEX = "1001"
 KOSDAQ_INDEX = "2001"
 INDEX_TICKERS = {"KOSPI": KOSPI_INDEX, "KOSDAQ": KOSDAQ_INDEX}
 MARKETS = ("KOSPI", "KOSDAQ", "KONEX")
+
+NAVER_INDEX_URL = "https://api.finance.naver.com/siseJson.naver"
+NAVER_INDEX_SYMBOLS = {"KOSPI": "KOSPI", "KOSDAQ": "KOSDAQ"}
+NAVER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://finance.naver.com/",
+}
 
 KIND_URL = "https://kind.krx.co.kr/corpgeneral/corpList.do"
 KIND_MARKET_CODES = {"KOSPI": "stockMkt", "KOSDAQ": "kosdaqMkt", "KONEX": "konexMkt"}
@@ -66,6 +85,13 @@ def ymd(date: dt.date) -> str:
 
 def has_krx_credentials() -> bool:
     return bool(os.getenv("KRX_ID") and os.getenv("KRX_PW"))
+
+
+def krx_login_ok() -> bool:
+    """pykrx 가 KRX 로그인 세션을 들고 있는지."""
+    from . import pykrx_safe
+
+    return pykrx_safe.KRX_LOGIN_OK
 
 
 def normalize_name(name: str) -> str:
@@ -138,9 +164,46 @@ def fetch_kind_listings(market: str, timeout: int = 30,
     raise RuntimeError(f"KIND {market} 상장법인목록 조회 실패: {last_err}")
 
 
+def load_listings_file(path: str, market: str = "미상") -> list[Listing]:
+    """KIND 에서 직접 내려받은 상장법인목록 파일을 읽는다.
+
+    KIND 의 '상장법인목록' 다운로드는 확장자가 .xls 이지만 실제로는 HTML 표다.
+    .xlsx / .csv 도 받는다. 필요한 열: 회사명, 종목코드, 상장일.
+    """
+    lowered = path.lower()
+    if lowered.endswith(".csv"):
+        df = pd.read_csv(path, dtype={"종목코드": str}, encoding="utf-8-sig")
+    elif lowered.endswith(".xlsx") or lowered.endswith(".xlsm"):
+        df = pd.read_excel(path, dtype={"종목코드": str})
+    else:  # KIND 다운로드(.xls) = HTML 표
+        with open(path, "rb") as fp:
+            raw = fp.read()
+        for encoding in ("euc-kr", "utf-8"):
+            try:
+                df = pd.read_html(io.StringIO(raw.decode(encoding)),
+                                  converters={"종목코드": str})[0]
+                break
+            except (UnicodeDecodeError, ValueError):
+                df = None
+        if df is None:
+            raise RuntimeError(f"상장법인목록 파일을 읽지 못했습니다: {path}")
+
+    listings = []
+    for _, row in df.iterrows():
+        ticker = str(row.get("종목코드", "")).strip().zfill(6)
+        name = str(row.get("회사명", row.get("종목명", ""))).strip()
+        if not re.fullmatch(r"\d{6}", ticker) or not name:
+            continue
+        listings.append(Listing(ticker, name, str(row.get("시장", market)),
+                                _parse_date(row.get("상장일")), "file"))
+    return listings
+
+
 @functools.lru_cache(maxsize=1024)
 def _krx_listings_on(date_str: str, market: str) -> tuple[Listing, ...]:
     """상장일 기준 KRX 전종목 (티커, 종목명). 실패하면 빈 튜플."""
+    if not krx_login_ok():
+        return ()
     for attempt in range(3):
         try:
             from pykrx.website import krx as _krx
@@ -188,9 +251,11 @@ class TickerResolver:
 
     def __init__(self, markets: tuple[str, ...] = MARKETS, use_kind: bool = True,
                  use_krx_by_date: bool = True, ticker_map_csv: str | None = None,
+                 listings_files: "list[str] | None" = None,
                  fuzzy_cutoff: float = 0.86, verbose: bool = True):
         self.markets = markets
         self.use_kind = use_kind
+        self.listings_files = listings_files or []
         self.use_krx_by_date = use_krx_by_date
         self.fuzzy_cutoff = fuzzy_cutoff
         self.verbose = verbose
@@ -225,9 +290,22 @@ class TickerResolver:
         if self._built:
             return
         self._built = True
+        total = 0
+
+        # 미리 받아둔 상장법인목록 파일 (KRX 차단 시 대안)
+        for spec in self.listings_files:
+            market, _, path = spec.partition("=")
+            if not path:
+                market, path = "미상", spec
+            listings = load_listings_file(path, market)
+            for listing in listings:
+                self.add(listing)
+            total += len(listings)
+            if self.verbose:
+                print(f"      파일 {path} ({market}): {len(listings)} 종목")
+
         if not self.use_kind:
             return
-        total = 0
         for market in self.markets:
             try:
                 listings = fetch_kind_listings(market)
@@ -366,10 +444,15 @@ def get_stock_ohlcv(ticker: str, start: dt.date, end: dt.date,
                     prefer: str = "krx") -> pd.DataFrame:
     """종목 일봉. 컬럼: 시가/고가/저가/종가/거래량, 인덱스: 날짜.
 
-    prefer="krx"  : 무수정 주가(KRX). 공모가 대비 계산에 적합. 로그인 필요.
+    prefer="krx"  : 무수정 주가(KRX). 공모가 대비 계산에 정확. 로그인 필요.
     prefer="naver": 수정 주가(네이버). 로그인 없이 조회 가능.
+
+    KRX 로그인이 없으면 KRX 시도를 건너뛴다(수백 번의 헛된 요청 방지).
     """
     order = ["krx", "naver"] if prefer == "krx" else ["naver", "krx"]
+    if not krx_login_ok():
+        order = [src for src in order if src != "krx"] or ["naver"]
+
     problems: list[str] = []
     for source in order:
         try:
@@ -386,7 +469,72 @@ def get_stock_ohlcv(ticker: str, start: dt.date, end: dt.date,
     raise RuntimeError(f"{ticker} OHLCV 조회 실패 ({'; '.join(problems)})")
 
 
-def get_index_ohlcv(index_ticker: str, start: dt.date, end: dt.date) -> pd.DataFrame:
-    """지수 일봉(KOSPI 1001 / KOSDAQ 2001)."""
-    df = stock.get_index_ohlcv_by_date(ymd(start), ymd(end), index_ticker)
-    return pd.DataFrame() if df is None else df
+def get_index_ohlcv_naver(market: str, start: dt.date, end: dt.date,
+                          timeout: int = 30, retries: int = 3) -> pd.DataFrame:
+    """네이버 지수 일봉 (로그인 불필요). market: KOSPI / KOSDAQ."""
+    params = {
+        "symbol": NAVER_INDEX_SYMBOLS[market],
+        "requestType": 1,
+        "startTime": ymd(start),
+        "endTime": ymd(end),
+        "timeframe": "day",
+    }
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            resp = requests.get(NAVER_INDEX_URL, params=params,
+                                headers=NAVER_HEADERS, timeout=timeout)
+            resp.raise_for_status()
+            return parse_naver_index(resp.text)
+        except Exception as exc:
+            last_err = exc
+            time.sleep(2**attempt)
+    raise RuntimeError(f"네이버 {market} 지수 조회 실패: {last_err}")
+
+
+def parse_naver_index(text: str) -> pd.DataFrame:
+    """siseJson.naver 응답(파이썬 리터럴 형태의 2차원 배열)을 DataFrame 으로."""
+    rows = ast.literal_eval(text.strip())
+    if not rows or len(rows) < 2:
+        return pd.DataFrame()
+    header = [str(h).strip() for h in rows[0]]
+    df = pd.DataFrame(rows[1:], columns=header)
+    df = df.rename(columns={"날짜": "날짜", "시가": "시가", "고가": "고가",
+                            "저가": "저가", "종가": "종가", "거래량": "거래량"})
+    df["날짜"] = pd.to_datetime(df["날짜"].astype(str), format="%Y%m%d")
+    df = df.set_index("날짜")
+    for col in ("시가", "고가", "저가", "종가"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    keep = [c for c in ("시가", "고가", "저가", "종가", "거래량") if c in df.columns]
+    return df[keep].dropna(subset=["종가"]).sort_index()
+
+
+def get_index_ohlcv(market: str, start: dt.date, end: dt.date,
+                    source: str = "auto") -> pd.DataFrame:
+    """지수 일봉. market 은 'KOSPI' / 'KOSDAQ' (또는 지수 티커 1001 / 2001).
+
+    source="auto" 면 KRX 로그인이 살아 있을 때만 KRX 를 쓰고, 아니면 네이버.
+    """
+    market = {v: k for k, v in INDEX_TICKERS.items()}.get(market, market)
+    problems: list[str] = []
+
+    if source in ("auto", "krx") and (source == "krx" or krx_login_ok()):
+        try:
+            df = stock.get_index_ohlcv_by_date(ymd(start), ymd(end),
+                                               INDEX_TICKERS[market])
+            if df is not None and not df.empty:
+                return df
+            problems.append("krx: 데이터 없음")
+        except Exception as exc:
+            problems.append(f"krx: {exc}")
+
+    if source in ("auto", "naver"):
+        try:
+            df = get_index_ohlcv_naver(market, start, end)
+            if not df.empty:
+                return df
+            problems.append("naver: 데이터 없음")
+        except Exception as exc:
+            problems.append(f"naver: {exc}")
+
+    raise RuntimeError(f"{market} 지수 조회 실패 ({'; '.join(problems)})")

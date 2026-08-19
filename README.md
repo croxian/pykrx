@@ -27,18 +27,34 @@
 pip install -r requirements.txt
 ```
 
-## KRX 로그인 (필수)
+## KRX 없이도 동작한다 (중요)
 
-pykrx 1.2.8 부터 `data.krx.co.kr` 조회에 KRX 계정이 필요하다.
+KRX 데이터 마켓플레이스(`data.krx.co.kr`)는 **자동화 대량 조회를 약관으로 금지**하며,
+감지되면 **해당 IP 를 1일간 차단**한다. 차단되면 로그인 응답이 JSON 이 아닌 HTML 로
+와서 pykrx 는 `JSONDecodeError` 로 죽는다(`import pykrx` 단계에서 터진다).
+
+그래서 이 수집기는 KRX 를 **선택 사항**으로 둔다.
+
+| 데이터 | 기본 경로 (KRX 불필요) | KRX 경로 |
+|---|---|---|
+| 공모가·상장일 | 38커뮤니케이션 | – |
+| 종목명→티커 | KIND 상장법인목록 (시장당 1회) | 전종목시세 |
+| 종목 일봉 | 네이버(수정주가) | KRX(무수정주가) |
+| KOSPI/KOSDAQ 지수 | 네이버 `api.finance.naver.com` | KRX |
+
+KRX 계정이 있으면 무수정주가를 쓸 수 있어 상장일 등락률이 더 정확하다.
 [data.krx.co.kr](http://data.krx.co.kr) 회원가입 후:
 
 ```bash
-export KRX_ID='아이디'
+export KRX_ID='아이디'      # Windows PowerShell: $env:KRX_ID="아이디"
 export KRX_PW='비밀번호'
 ```
 
-없으면 지수(KOSPI/KOSDAQ) 데이터와 종목명→티커 매핑이 실패한다.
-종목 시세만은 `--price-source naver` 로 로그인 없이 받을 수 있다(수정주가).
+로그인이 실패하거나 IP 가 차단된 상태면 자동으로 네이버 경로로 넘어간다.
+아예 KRX 를 건드리지 않으려면 `--no-krx` 를 쓴다.
+
+**차단됐다면**: 하루 기다리거나 `--no-krx` 로 실행한다. 대량 데이터가 정기적으로
+필요하면 KRX Open API(`openapi.krx.co.kr`) 같은 공식 경로를 쓰는 게 맞다.
 
 ## 실행
 
@@ -51,6 +67,14 @@ python -m ipo_returns.cli --exclude-spac --csv 신규상장_등락률.csv
 
 # 38 접속이 막힌 환경: 브라우저로 저장해 둔 목록 페이지들을 파싱
 python -m ipo_returns.cli --html-dir ./38_pages
+
+# KRX 가 IP 를 차단한 상태 (KRX 를 아예 건드리지 않음)
+python -m ipo_returns.cli --no-krx
+
+# KIND 접속까지 막혔다면: 브라우저로 받은 상장법인목록 파일을 넘긴다
+#   kind.krx.co.kr -> 상장법인상세정보 -> 상장법인목록 -> 엑셀 다운로드
+python -m ipo_returns.cli --no-krx \
+    --listings-file KOSPI=kospi.xls --listings-file KOSDAQ=kosdaq.xls
 ```
 
 주요 옵션
@@ -67,6 +91,10 @@ python -m ipo_returns.cli --html-dir ./38_pages
 | `--ticker-map` | 수동 매핑 CSV (`종목명,종목코드,시장`) 로 매칭 보정 |
 | `--no-krx-fallback` | 티커 매칭에 KRX 전종목시세를 쓰지 않음 (KIND 만 사용) |
 | `--no-verify-listing` | 상장일 이전 시세 검증 건너뜀 |
+| `--no-krx` | KRX 를 아예 쓰지 않음 (로그인 시도조차 안 함) |
+| `--index-source` | `auto`(기본) / `krx` / `naver` |
+| `--listings-file` | KIND 에서 직접 받은 상장법인목록 파일 (`KOSPI=kospi.xls`, 여러 번 지정 가능) |
+| `--request-sleep` | 종목별 요청 간격 (초, 기본 0.3) |
 
 ## 실행 전 점검
 
@@ -127,6 +155,11 @@ KRX(`data.krx.co.kr`)가 JSON 대신 HTML 을 돌려준 것이다. 세션 만료
 조용히 매칭이 실패한다. 지금은 티커 매칭을 KIND(요청 3회)로 처리하므로 이
 경로를 거의 타지 않는다. 그래도 자주 보이면 잠시 뒤 다시 실행하거나
 `--no-krx-fallback` 을 쓴다.
+
+**`KDM 이용 제한 안내` / 로그인 단계에서 `JSONDecodeError`**
+
+KRX 가 자동화 조회를 감지해 IP 를 1일간 차단한 상태다. `--no-krx` 로 실행하면
+네이버 경로로 그대로 수집된다. 차단이 풀린 뒤에도 `--request-sleep` 을 낮추지 말 것.
 
 **티커 매칭 실패가 많다** → `티커매칭` 시트와 `수집실패` 시트를 비교하고,
 남는 종목은 `--ticker-map` CSV 로 지정한다.

@@ -99,3 +99,25 @@ class AssignTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NaverIndexParseTest(unittest.TestCase):
+    SAMPLE = """[['날짜', '시가', '고가', '저가', '종가', '거래량', '외국인소진율'],
+["20240102", 2669.81, 2676.19, 2645.61, 2669.81, 471244, 0.00],
+["20240103", 2660.51, 2660.51, 2601.99, 2607.31, 522910, 0.00]]"""
+
+    def test_parse(self):
+        from ipo_returns.krxdata import parse_naver_index
+
+        df = parse_naver_index(self.SAMPLE)
+        self.assertEqual(list(df.columns)[:4], ["시가", "고가", "저가", "종가"])
+        self.assertEqual(len(df), 2)
+        self.assertAlmostEqual(df.iloc[1]["종가"], 2607.31)
+        self.assertEqual(str(df.index[0].date()), "2024-01-02")
+
+    def test_pct_change_matches_index_definition(self):
+        from ipo_returns.krxdata import parse_naver_index
+        from ipo_returns.pipeline import pct_change_from_prev_close
+
+        pct = pct_change_from_prev_close(parse_naver_index(self.SAMPLE))
+        self.assertAlmostEqual(pct.iloc[1]["종가"], (2607.31 / 2669.81 - 1) * 100)

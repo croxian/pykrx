@@ -9,15 +9,22 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import sys
+import time
 
 import pandas as pd
 
-from . import ipo38, krxdata
 from .excel_report import write_report
 from .pipeline import collect, pct_change_from_prev_close
 
 SPAC_PATTERNS = ("스팩", "기업인수목적")
+
+
+def _sleep_then(seconds: float, fn):
+    if seconds > 0:
+        time.sleep(seconds)
+    return fn()
 
 
 def parse_date(text: str) -> dt.date:
@@ -38,7 +45,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--html-dir", default=None,
                    help="네트워크 대신 로컬에 저장한 38 페이지(HTML) 디렉터리")
     p.add_argument("--price-source", choices=("krx", "naver"), default="krx",
-                   help="종목 시세 소스 (krx=무수정주가, naver=수정주가)")
+                   help="종목 시세 소스 (krx=무수정주가, naver=수정주가). "
+                        "KRX 로그인이 없으면 자동으로 naver 를 쓴다")
+    p.add_argument("--index-source", choices=("auto", "krx", "naver"), default="auto",
+                   help="지수 소스 (auto=KRX 로그인 되면 KRX, 아니면 네이버)")
     p.add_argument("--exclude-spac", action="store_true", help="스팩 종목 제외")
     p.add_argument("--limit", type=int, default=0, help="처리 종목 수 제한 (테스트용)")
     p.add_argument("--ticker-map", default=None,
@@ -47,17 +57,35 @@ def build_parser() -> argparse.ArgumentParser:
                    help="티커 매칭 시 KRX 전종목시세 조회를 쓰지 않음 (KIND 만 사용)")
     p.add_argument("--no-verify-listing", action="store_true",
                    help="상장일 이전 시세 검증을 건너뜀")
+    p.add_argument("--listings-file", action="append", default=[],
+                   metavar="시장=경로",
+                   help="KIND 에서 직접 받은 상장법인목록 파일 "
+                        "(예: KOSPI=kospi.xls). 여러 번 지정 가능")
+    p.add_argument("--request-sleep", type=float, default=0.3,
+                   help="종목별 시세 요청 사이 대기 (초, 기본 0.3). "
+                        "차단 방지를 위해 너무 낮추지 말 것")
+    p.add_argument("--no-krx", action="store_true",
+                   help="KRX(data.krx.co.kr) 를 아예 쓰지 않음 "
+                        "(로그인 시도조차 하지 않는다)")
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    # pykrx 는 import 시점에 KRX 로그인을 시도하므로 옵션 처리 후에 불러온다
+    if args.no_krx:
+        os.environ["IPO_NO_KRX"] = "1"
+    from . import ipo38, krxdata
     out_path = args.out or f"신규상장_등락률_{args.start:%Y%m%d}_{args.end:%Y%m%d}.xlsx"
 
-    if not krxdata.has_krx_credentials():
-        print("[경고] KRX_ID / KRX_PW 환경변수가 없습니다. pykrx 1.2.8+ 는 KRX 조회에 "
-              "로그인이 필요하며, 지수(KOSPI/KOSDAQ) 데이터와 종목명→티커 매핑이 "
-              "실패할 수 있습니다.", file=sys.stderr)
+    if krxdata.krx_login_ok():
+        print("KRX 로그인 세션 사용 (무수정주가·지수를 KRX 에서 조회)")
+    else:
+        print("[안내] KRX 로그인 없이 실행합니다: 티커는 KIND, 종목 시세와 지수는 "
+              "네이버에서 받습니다. 종목 시세는 수정주가라 상장 이후 액면분할·"
+              "무상증자가 있었던 종목은 상장일 등락률이 실제와 다를 수 있습니다.",
+              file=sys.stderr)
 
     print(f"[1/4] 38커뮤니케이션에서 신규상장 목록 수집 "
           f"({args.start} ~ {args.end})")
@@ -75,7 +103,8 @@ def main(argv: list[str] | None = None) -> int:
     print("[2/5] 티커 매칭 (KIND 상장법인목록 기준)")
     resolver = krxdata.TickerResolver(
         ticker_map_csv=args.ticker_map,
-        use_krx_by_date=not args.no_krx_fallback,
+        listings_files=args.listings_file,
+        use_krx_by_date=not (args.no_krx_fallback or args.no_krx),
     )
     resolver.assign(ipos)
     matched = sum(1 for r in ipos if (r.name, r.listing_date) in resolver.resolutions)
@@ -86,9 +115,10 @@ def main(argv: list[str] | None = None) -> int:
     idx_start = min(r.listing_date for r in ipos) - dt.timedelta(days=15)
     idx_end = max(r.listing_date for r in ipos) + dt.timedelta(days=30)
     index_pct: dict[str, pd.DataFrame] = {}
-    for name, ticker in krxdata.INDEX_TICKERS.items():
+    for name in krxdata.INDEX_TICKERS:
         try:
-            frame = krxdata.get_index_ohlcv(ticker, idx_start, idx_end)
+            frame = krxdata.get_index_ohlcv(name, idx_start, idx_end,
+                                            source=args.index_source)
         except Exception as exc:
             print(f"      [경고] {name} 지수 조회 실패: {exc}", file=sys.stderr)
             frame = pd.DataFrame()
@@ -99,8 +129,9 @@ def main(argv: list[str] | None = None) -> int:
     main_df, bearish_df, skipped = collect(
         ipos,
         resolve_ticker=resolver.resolve,
-        fetch_ohlcv=lambda t, s, e: krxdata.get_stock_ohlcv(
-            t, s, e, prefer=args.price_source),
+        fetch_ohlcv=lambda t, s, e: _sleep_then(
+            args.request_sleep,
+            lambda: krxdata.get_stock_ohlcv(t, s, e, prefer=args.price_source)),
         index_pct=index_pct,
         days=args.days,
         verify_listing=not args.no_verify_listing,
@@ -128,7 +159,8 @@ def main(argv: list[str] | None = None) -> int:
         "음봉 제외 종목 수": len(bearish_df),
         "수집 실패 종목 수": len(failed_df),
         "수집 일수": f"D+0 ~ D+{args.days - 1}",
-        "시세 소스": args.price_source,
+        "시세 소스": args.price_source if krxdata.krx_login_ok() else "naver",
+        "지수 소스": args.index_source,
         "생성 시각": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     write_report(out_path, main_df, bearish_df, failed_df, meta, match_df)
