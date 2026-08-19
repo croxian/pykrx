@@ -139,3 +139,41 @@ class DigitGuardTest(unittest.TestCase):
         resolver = offline_resolver(listings)
         resolver.assign([IpoRow("디비금융스팩11호", 2000, dt.date(2023, 7, 12))])
         self.assertIsNone(resolver.resolve("디비금융스팩11호", dt.date(2023, 7, 12)))
+
+
+class KrxNewListingTest(unittest.TestCase):
+    """상장일 스냅샷 차집합으로 티커를 찾는 경로 (KRX 로그인 필요)."""
+
+    def setUp(self):
+        from ipo_returns import krxdata
+
+        self.krxdata = krxdata
+        krxdata._krx_listings_on.cache_clear()
+        krxdata.krx_new_listings_on.cache_clear()
+        self.snapshots = {
+            ("20230810", "KOSDAQ"): [("111111", "가나"), ("222222", "다라"),
+                                     ("333333", "케이비제26호기업인수목적")],
+            ("20230809", "KOSDAQ"): [("111111", "가나"), ("222222", "다라")],
+        }
+
+        def fake(date_str, market):
+            rows = self.snapshots.get((date_str, market), [])
+            return tuple(krxdata.Listing(t, n, market, None, "krx") for t, n in rows)
+
+        self._real = krxdata._krx_listings_on
+        krxdata._krx_listings_on = fake
+
+    def tearDown(self):
+        self.krxdata._krx_listings_on = self._real
+
+    def test_diff_finds_the_new_ticker(self):
+        fresh = self.krxdata.krx_new_listings_on("20230810", "KOSDAQ")
+        self.assertEqual([l.ticker for l in fresh], ["333333"])
+
+    def test_resolver_uses_it_for_spac_names(self):
+        resolver = TickerResolver(use_kind=False, use_naver_search=False,
+                                  use_krx_by_date=True, verbose=False)
+        resolver._built = True
+        found = resolver.resolve_detail("KB스팩26호", dt.date(2023, 8, 10))
+        self.assertEqual(found.ticker, "333333")
+        self.assertIn("krx-new", found.method)

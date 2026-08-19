@@ -45,6 +45,13 @@ KOSPI_INDEX = "1001"
 KOSDAQ_INDEX = "2001"
 INDEX_TICKERS = {"KOSPI": KOSPI_INDEX, "KOSDAQ": KOSDAQ_INDEX}
 MARKETS = ("KOSPI", "KOSDAQ", "KONEX")
+# 상장일 기준 KRX 조회는 코스닥부터 (스팩·중소형 신규상장이 대부분)
+LOOKUP_MARKETS = ("KOSDAQ", "KOSPI", "KONEX")
+
+# KRX 는 자동화 대량 조회를 감지하면 IP 를 1일 차단한다. 상장일 기준 조회는
+# 마지막 수단으로만 쓰고, 총 요청 수에 상한을 둔다.
+_krx_lookup_budget = 120
+_krx_lookup_used = 0
 
 NAVER_INDEX_URL = "https://api.finance.naver.com/siseJson.naver"
 NAVER_INDEX_SYMBOLS = {"KOSPI": "KOSPI", "KOSDAQ": "KOSDAQ"}
@@ -86,6 +93,13 @@ def ymd(date: dt.date) -> str:
 
 def has_krx_credentials() -> bool:
     return bool(os.getenv("KRX_ID") and os.getenv("KRX_PW"))
+
+
+def set_krx_lookup_budget(count: int) -> None:
+    """상장일 기준 KRX 조회 요청 수 상한을 설정한다."""
+    global _krx_lookup_budget
+
+    _krx_lookup_budget = max(0, count)
 
 
 def _looks_like_login_failure(exc: Exception) -> bool:
@@ -284,8 +298,18 @@ def load_listings_file(path: str, market: str = "미상") -> list[Listing]:
 @functools.lru_cache(maxsize=1024)
 def _krx_listings_on(date_str: str, market: str) -> tuple[Listing, ...]:
     """상장일 기준 KRX 전종목 (티커, 종목명). 실패하면 빈 튜플."""
+    global _krx_lookup_used
+
     if not krx_login_ok():
         return ()
+    if _krx_lookup_used >= _krx_lookup_budget:
+        if _krx_lookup_used == _krx_lookup_budget:
+            _krx_lookup_used += 1
+            print("      [안내] 상장일 기준 KRX 조회 상한에 도달해 중단합니다 "
+                  "(--krx-lookup-budget 로 조정).")
+        return ()
+    _krx_lookup_used += 1
+    time.sleep(1.0)  # KRX 차단 회피: 상장일 조회는 천천히
     for attempt in range(3):
         try:
             from pykrx.website import krx as _krx
@@ -321,6 +345,29 @@ class Resolution:
     method: str            # date-match / date-unique / name / spac / krx / fuzzy / manual
     matched_name: str
     score: float = 1.0
+
+
+@functools.lru_cache(maxsize=1024)
+def krx_new_listings_on(date_str: str, market: str) -> tuple[Listing, ...]:
+    """그 날 **새로 생긴** 티커들.
+
+    상장일의 전종목 목록에서 직전 거래일 목록을 빼면 그날 신규 상장한 종목만
+    남는다. 이름을 맞출 필요가 없어 표기 차이(스팩·사명 변경)에 영향을 받지
+    않고, 지금은 합병·상장폐지된 종목도 그대로 잡힌다.
+
+    다만 KRX 조회라 로그인이 필요하고 요청 상한(:func:`set_krx_lookup_budget`)의
+    적용을 받는다.
+    """
+    today = _krx_listings_on(date_str, market)
+    if not today:
+        return ()
+    date = dt.datetime.strptime(date_str, "%Y%m%d").date()
+    for back in range(1, 6):
+        previous = _krx_listings_on(ymd(date - dt.timedelta(days=back)), market)
+        if previous:
+            known = {listing.ticker for listing in previous}
+            return tuple(l for l in today if l.ticker not in known)
+    return ()
 
 
 class TickerResolver:
@@ -492,19 +539,32 @@ class TickerResolver:
                 self.resolutions[(name, on_date)] = found
                 return found
 
-        # KRX 전종목시세(상장일 기준) — KIND 에 없는 종목 대응
+        # KRX 상장일 스냅샷 — KIND 에 없는 종목(합병·상폐된 스팩 등) 대응
         if self.use_krx_by_date:
-            for market in self.markets:
-                listings = _krx_listings_on(ymd(on_date), market)
-                for listing in listings:
+            for market in LOOKUP_MARKETS:
+                fresh = krx_new_listings_on(ymd(on_date), market)
+                if not fresh:
+                    continue
+                for listing in fresh:
                     self.add(listing)
-                for listing in listings:
-                    score = self.name_score(name, listing.name)
-                    if score >= 0.95:
-                        found = Resolution(listing.ticker, listing.market, "krx",
-                                           listing.name, score)
-                        self.resolutions[(name, on_date)] = found
-                        return found
+                claimed = {r.ticker for r in self.resolutions.values()}
+                free = [l for l in fresh if l.ticker not in claimed]
+                scored = sorted(((self.name_score(name, l.name), l) for l in free),
+                                key=lambda pair: pair[0], reverse=True)
+                if scored and scored[0][0] >= 0.5:
+                    score, listing = scored[0]
+                    found = Resolution(listing.ticker, listing.market,
+                                       "krx-new", listing.name, score)
+                    self.resolutions[(name, on_date)] = found
+                    return found
+                if len(free) == 1:
+                    # 그날 그 시장에서 새로 생긴 티커가 하나뿐이면 그것이다
+                    listing = free[0]
+                    found = Resolution(listing.ticker, listing.market,
+                                       "krx-new-unique", listing.name,
+                                       self.name_score(name, listing.name))
+                    self.resolutions[(name, on_date)] = found
+                    return found
 
         # 네이버 금융 검색 (KIND 목록에 없는 스팩·리츠 등 대응)
         if self.use_naver_search:

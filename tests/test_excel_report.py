@@ -21,6 +21,8 @@ def sample_main_df():
             "날짜": dt.date(2024, 3, 21 + offset),
             "시가등락률": o, "고가등락률": o + 5, "저가등락률": o - 5,
             "종가등락률": c, "KOSPI_종가": idx, "KOSDAQ_종가": idx,
+            "KOSPI_캔들": "양봉" if idx > 0 else "음봉",
+            "KOSDAQ_캔들": "양봉" if idx > 0 else "음봉",
         })
         rows.append(row)
     return pd.DataFrame(rows, columns=COLUMNS)
@@ -52,7 +54,9 @@ class ExcelReportTest(unittest.TestCase):
                          ["종목명", "종목코드", "시장", "공모가", "구분", "날짜"])
         self.assertEqual(headers[6:10], ["시가", "고가", "저가", "종가"])
         self.assertEqual(ws.cell(row=1, column=11).value, "KOSPI 등락률")
-        self.assertEqual(ws.cell(row=1, column=15).value, "KOSDAQ 등락률")
+        self.assertEqual(ws.cell(row=1, column=16).value, "KOSDAQ 등락률")
+        self.assertEqual(headers[14], "양/음봉")
+        self.assertEqual(headers[19], "양/음봉")
 
     def test_positive_red_negative_blue(self):
         ws = self.wb["신규상장_등락률"]
@@ -66,7 +70,21 @@ class ExcelReportTest(unittest.TestCase):
     def test_index_cells_are_colored_too(self):
         ws = self.wb["신규상장_등락률"]
         self.assertEqual(ws.cell(row=3, column=14).font.color.rgb, RED)   # KOSPI 종가
-        self.assertEqual(ws.cell(row=4, column=18).font.color.rgb, BLUE)  # KOSDAQ 종가
+        self.assertEqual(ws.cell(row=4, column=19).font.color.rgb, BLUE)  # KOSDAQ 종가
+
+    def test_index_candle_columns(self):
+        ws = self.wb["신규상장_등락률"]
+        self.assertEqual(ws.cell(row=3, column=15).value, "양봉")
+        self.assertEqual(ws.cell(row=3, column=15).font.color.rgb, RED)
+        self.assertEqual(ws.cell(row=4, column=20).value, "음봉")
+        self.assertEqual(ws.cell(row=4, column=20).font.color.rgb, BLUE)
+
+    def test_listing_day_row_is_shaded(self):
+        ws = self.wb["신규상장_등락률"]
+        for col in range(1, 21):     # D+0 행 전체
+            self.assertEqual(ws.cell(row=3, column=col).fill.fgColor.rgb,
+                             "FFF2F2F2", f"col {col}")
+        self.assertNotEqual(ws.cell(row=4, column=1).fill.fgColor.rgb, "FFF2F2F2")
 
     def test_side_sheets(self):
         self.assertEqual(self.wb["제외_음봉"].cell(row=2, column=1).value, "다라바이오")

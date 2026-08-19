@@ -19,7 +19,9 @@ import pandas as pd
 from .ipo38 import IpoRow
 
 OHLC = ("시가", "고가", "저가", "종가")
-INDEX_COLUMNS = [f"{idx}_{col}" for idx in ("KOSPI", "KOSDAQ") for col in OHLC]
+INDEXES = ("KOSPI", "KOSDAQ")
+INDEX_COLUMNS = [f"{idx}_{col}" for idx in INDEXES
+                 for col in (*OHLC, "캔들")]
 
 COLUMNS = (
     ["종목명", "종목코드", "시장", "공모가", "구분", "날짜"]
@@ -46,26 +48,43 @@ class Skipped:
     reason: str
 
 
+def candle_label(open_price: float, close_price: float) -> str:
+    """양봉 / 음봉 / 보합."""
+    if close_price > open_price:
+        return "양봉"
+    if close_price < open_price:
+        return "음봉"
+    return "보합"
+
+
 def pct_change_from_prev_close(df: pd.DataFrame) -> pd.DataFrame:
-    """일봉 OHLC 를 '전 거래일 종가 대비 등락률(%)' 로 변환."""
+    """일봉 OHLC 를 '전 거래일 종가 대비 등락률(%)' 로 변환.
+
+    당일 양봉/음봉 여부('캔들' 열)도 함께 담는다.
+    """
     if df.empty:
-        return pd.DataFrame(columns=list(OHLC))
+        return pd.DataFrame(columns=[*OHLC, "캔들"])
     prev_close = df["종가"].shift(1)
     out = pd.DataFrame(index=df.index)
     for col in OHLC:
         out[col] = (df[col] / prev_close - 1.0) * 100.0
+    out["캔들"] = [candle_label(float(o), float(c))
+                 for o, c in zip(df["시가"], df["종가"])]
     return out
 
 
 def _index_row(index_pct: dict[str, pd.DataFrame], date: pd.Timestamp) -> dict:
-    values: dict[str, float | None] = {}
+    values: dict = {}
     for name, frame in index_pct.items():
+        available = (frame is not None and not frame.empty
+                     and date in frame.index)
         for col in OHLC:
             value = None
-            if frame is not None and not frame.empty and date in frame.index:
+            if available:
                 raw = frame.at[date, col]
                 value = None if pd.isna(raw) else float(raw)
             values[f"{name}_{col}"] = value
+        values[f"{name}_캔들"] = frame.at[date, "캔들"] if available else None
     return values
 
 

@@ -70,6 +70,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--request-sleep", type=float, default=0.3,
                    help="종목별 시세 요청 사이 대기 (초, 기본 0.3). "
                         "차단 방지를 위해 너무 낮추지 말 것")
+    p.add_argument("--krx-lookup-budget", type=int, default=120,
+                   help="티커를 못 찾았을 때 상장일 기준 KRX 조회를 몇 번까지 "
+                        "허용할지 (기본 120). KRX 차단을 피하기 위한 상한")
     p.add_argument("--no-krx", action="store_true",
                    help="KRX(data.krx.co.kr) 를 아예 쓰지 않음 "
                         "(로그인 시도조차 하지 않는다)")
@@ -111,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print("[2/5] 티커 매칭 (KIND 상장법인목록 기준)")
+    krxdata.set_krx_lookup_budget(args.krx_lookup_budget)
     resolver = krxdata.TickerResolver(
         ticker_map_csv=args.ticker_map,
         listings_files=args.listings_file,

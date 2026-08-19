@@ -18,6 +18,7 @@ from .pipeline import COLUMNS, OHLC
 RED = "FFFF0000"
 BLUE = "FF0000FF"
 HEADER_FILL = PatternFill("solid", fgColor="FFD9E1F2")
+# '흰색, 배경 1, 5% 더 어둡게' = F2F2F2
 GROUP_FILL = PatternFill("solid", fgColor="FFF2F2F2")
 THIN = Side(style="thin", color="FFBFBFBF")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
@@ -26,6 +27,7 @@ PCT_FORMAT = '+0.00"%";-0.00"%";0.00"%"'
 RATE_COLUMNS = [f"{c}등락률" for c in OHLC] + [
     f"{idx}_{c}" for idx in ("KOSPI", "KOSDAQ") for c in OHLC
 ]
+CANDLE_COLUMNS = ["KOSPI_캔들", "KOSDAQ_캔들"]
 
 HEADER_LABELS = {
     "시가등락률": "시가",
@@ -40,11 +42,13 @@ HEADER_LABELS = {
     "KOSDAQ_고가": "고가",
     "KOSDAQ_저가": "저가",
     "KOSDAQ_종가": "종가",
+    "KOSPI_캔들": "양/음봉",
+    "KOSDAQ_캔들": "양/음봉",
 }
 
 WIDTHS = {
     "종목명": 18, "종목코드": 10, "시장": 8, "공모가": 10,
-    "구분": 7, "날짜": 12,
+    "구분": 7, "날짜": 12, "KOSPI_캔들": 8, "KOSDAQ_캔들": 8,
 }
 
 
@@ -69,8 +73,8 @@ def _write_main_sheet(ws, df: pd.DataFrame) -> None:
     groups = [
         ("", 1, 6),
         ("종목 등락률 (D+0 은 공모가 대비, 이후는 전일 종가 대비)", 7, 10),
-        ("KOSPI 등락률", 11, 14),
-        ("KOSDAQ 등락률", 15, 18),
+        ("KOSPI 등락률", 11, 15),
+        ("KOSDAQ 등락률", 16, 20),
     ]
     for title, start, end in groups:
         if title:
@@ -92,7 +96,7 @@ def _write_main_sheet(ws, df: pd.DataFrame) -> None:
 
     row_no = 3
     for _, record in df.iterrows():
-        shade = record["구분"] == "D+0"
+        shade = record["구분"] == "D+0"        # 상장일 행은 전체를 옅게 채운다
         for col_idx, name in enumerate(COLUMNS, start=1):
             value = record[name]
             if isinstance(value, float) and pd.isna(value):
@@ -108,7 +112,11 @@ def _write_main_sheet(ws, df: pd.DataFrame) -> None:
                 colorize=is_rate,
                 align="left" if name == "종목명" else "center",
             )
-            if shade and not is_rate:
+            if name in CANDLE_COLUMNS and value:
+                cell.font = Font(color=RED if value == "양봉" else
+                                 BLUE if value == "음봉" else "FF808080",
+                                 bold=True)
+            if shade:
                 cell.fill = GROUP_FILL
         row_no += 1
 
@@ -150,7 +158,9 @@ def _write_info_sheet(ws, meta: dict) -> None:
         ("", "D+1~D+4 = (당일 시/고/저/종가 ÷ 전 거래일 종가 - 1) × 100"),
         ("", "지수 = (당일 지수 시/고/저/종 ÷ 전 거래일 지수 종가 - 1) × 100"),
         ("필터", "상장일 종가 > 시가(양봉)인 종목만 수록. 음봉/보합 종목은 '제외_음봉' 시트"),
-        ("색상", "+ 등락률 = 빨강, - 등락률 = 파랑"),
+        ("색상", "+ 등락률 = 빨강, - 등락률 = 파랑 / 지수 양봉 = 빨강, 음봉 = 파랑"),
+        ("지수 양/음봉", "그날 지수의 시가 대비 종가 (종가>시가 = 양봉)"),
+        ("상장일 행", "D+0 행은 옅은 회색(흰색, 배경 1, 5% 더 어둡게)으로 채움"),
         ("데이터 출처", "공모가·상장일: 38커뮤니케이션 / 주가·지수: KRX(pykrx)"),
     ]
     for r, (key, value) in enumerate(rows, start=1):
